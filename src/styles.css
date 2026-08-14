@@ -124,7 +124,93 @@ pre {
   border-right: none;
   border-top: none;
   border-bottom: none;
-  overflow-y: auto;
+  overflow: hidden;
+}
+
+/* ---------- AI dock: embedded webview tabs ---------- */
+.dock-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.dock-tab {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 2px;
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.dock-tab:hover {
+  border-color: var(--text-dim);
+}
+.dock-tab.active {
+  box-shadow: 0 0 0 1px var(--accent);
+  border-color: var(--accent);
+}
+.dock-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.dock-tab .provider-status {
+  font-size: 9px;
+  color: var(--text-dim);
+  text-transform: capitalize;
+}
+.dock-webview {
+  flex: 1;
+  min-height: 220px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+  overflow: hidden;
+}
+.dock-webview .empty-hint {
+  height: 100%;
+  justify-content: center;
+}
+.dock-error {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  text-align: center;
+  color: var(--error);
+  font-size: 12px;
+}
+.dock-status {
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  min-height: 16px;
+}
+.toast {
+  position: fixed;
+  bottom: 34px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--elevated);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  z-index: 2000;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
 }
 
 .panel-title {
@@ -173,6 +259,82 @@ pre {
 }
 
 /* ---------- Sidebar tree ---------- */
+.title-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.tree-item.active .tree-name {
+  color: var(--accent);
+}
+
+.git-badge {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: #0a0a0f;
+}
+.badge-M {
+  background: var(--warning);
+}
+.badge-A {
+  background: var(--success);
+}
+.badge-D {
+  background: var(--error);
+}
+.badge-U {
+  background: #8b8b9e;
+}
+.badge-R,
+.badge-C {
+  background: #22d3ee;
+}
+
+.loading-row {
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 2px 0;
+}
+
+/* ---------- Context menu ---------- */
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 170px;
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  padding: 4px;
+}
+.context-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.context-item:hover {
+  background: var(--accent);
+  color: #fff;
+}
+.context-item.danger:hover {
+  background: var(--error);
+}
+.context-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 6px;
+}
 .project-name {
   padding: 6px 10px;
   font-size: 11px;
@@ -288,8 +450,9 @@ pre {
 }
 .terminal-container {
   flex: 1;
-  padding: 6px;
+  padding: 0;
   background: var(--bg);
+  overflow: hidden;
 }
 .terminal-container .xterm {
   height: 100%;

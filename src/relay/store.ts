@@ -22,7 +22,7 @@ interface RelayState {
   updateActiveFile: (content: string) => void;
   saveActiveFile: () => Promise<void>;
   refreshSession: () => Promise<void>;
-  runHandoff: () => Promise<void>;
+  runHandoff: () => Promise<RelayPacket | null>;
 }
 
 export const useRelayStore = create<RelayState>((set, get) => ({
@@ -92,6 +92,10 @@ export const useRelayStore = create<RelayState>((set, get) => ({
       const packet = await invoke<RelayPacket>("handoff", { reason: "manual" });
       set({ lastPacket: packet });
       await get().refreshSession();
+      return packet;
+    } catch (e) {
+      console.error("handoff failed", e);
+      return null;
     } finally {
       set({ busy: false });
     }

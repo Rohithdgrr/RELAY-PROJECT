@@ -18,6 +18,9 @@ const LANG_BY_EXT: Record<string, string> = {
   yml: "yaml",
 };
 
+// Works with both Windows (\) and POSIX (/) paths.
+const basename = (p: string) => p.split(/[\\/]/).pop() ?? p;
+
 function languageFor(path: string): string {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return LANG_BY_EXT[ext] ?? "plaintext";
@@ -51,7 +54,7 @@ export default function EditorPane() {
         {openFiles.map((f) => (
           <span key={f.path} className={f.path === activeFile ? "tab active" : "tab"}>
             {f.dirty && <span className="dirty-dot">●</span>}
-            {f.path.split("/").pop()}
+            {basename(f.path)}
           </span>
         ))}
         <span className="tab-spacer" />

@@ -3,6 +3,10 @@
 //! Enforces the security rules from Complete Docs §8.4: read-only patterns
 //! (`.env*`, `node_modules`, keys), size caps, backups before overwrite, and
 //! atomic writes.
+//!
+//! All filesystem work runs off the main thread (`spawn_blocking`) so the UI
+//! never freezes — including the native folder dialog, which previously ran
+//! on the main thread and could hang the window.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -33,6 +37,14 @@ pub struct DirEntry {
     pub size: Option<u64>,
 }
 
+#[derive(Serialize)]
+pub struct GitStatusEntry {
+    /// Repository-relative path (forward slashes), as reported by git.
+    pub path: String,
+    /// Porcelain code, e.g. "??", " M", "A ", "D ".
+    pub code: String,
+}
+
 fn is_read_only(path: &str) -> bool {
     let p = Path::new(path);
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -50,13 +62,27 @@ fn is_read_only(path: &str) -> bool {
     })
 }
 
-#[tauri::command]
-pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
-    let dir = PathBuf::from(&path);
+fn validate_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains(':') || name.contains('\0') {
+        return Err("name cannot contain path separators".into());
+    }
+    Ok(name.to_string())
+}
+
+fn list_dir_blocking(path: &str) -> Result<Vec<DirEntry>, String> {
+    let dir = PathBuf::from(path);
     let mut entries: Vec<DirEntry> = Vec::new();
     let rd = fs::read_dir(&dir).map_err(|e| format!("cannot read {path}: {e}"))?;
     for entry in rd.flatten() {
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        // Skip individual bad entries (broken junctions, permissions) instead
+        // of failing the whole listing.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = file_type.is_dir();
         if !is_dir && !file_type.is_file() {
@@ -85,26 +111,13 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
-#[tauri::command]
-pub fn read_file(path: String) -> Result<String, String> {
-    let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(format!(
-            "file too large ({} bytes; cap is {MAX_FILE_BYTES})",
-            meta.len()
-        ));
-    }
-    fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))
-}
-
-#[tauri::command]
-pub fn write_file(path: String, content: String) -> Result<(), String> {
-    if is_read_only(&path) {
+fn write_file_blocking(path: &str, content: &str) -> Result<(), String> {
+    if is_read_only(path) {
         return Err(format!(
             "{path} is protected by Relay's read-only patterns (Complete Docs §8.4)"
         ));
     }
-    let target = PathBuf::from(&path);
+    let target = PathBuf::from(path);
 
     // Backup before edit (Complete Docs §8.4: backup_before_edit = true).
     if let Some(parent) = target.parent() {
@@ -135,11 +148,151 @@ pub fn write_file(path: String, content: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn pick_project_dir() -> Result<Option<String>, String> {
-    Ok(rfd::FileDialog::new()
-        .set_title("Select your project folder")
-        .pick_folder()
-        .map(|p| p.display().to_string()))
+pub async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_dir_blocking(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn read_file(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
+        if meta.len() > MAX_FILE_BYTES {
+            return Err(format!(
+                "file too large ({} bytes; cap is {MAX_FILE_BYTES})",
+                meta.len()
+            ));
+        }
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn write_file(path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_file_blocking(&path, &content))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn create_file(parent: String, name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = validate_name(&name)?;
+        let path = PathBuf::from(&parent).join(&name);
+        let path_str = path.display().to_string();
+        if is_read_only(&path_str) {
+            return Err(format!(
+                "{path_str} is protected by Relay's read-only patterns"
+            ));
+        }
+        if path.exists() {
+            return Err(format!("{name} already exists"));
+        }
+        fs::write(&path, "").map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn create_dir(parent: String, name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = validate_name(&name)?;
+        let path = PathBuf::from(&parent).join(&name);
+        if path.exists() {
+            return Err(format!("{name} already exists"));
+        }
+        fs::create_dir(&path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn rename_path(path: String, new_name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let new_name = validate_name(&new_name)?;
+        if is_read_only(&path) {
+            return Err(format!(
+                "{path} is protected by Relay's read-only patterns"
+            ));
+        }
+        let target = PathBuf::from(&path);
+        let parent = target.parent().ok_or("path has no parent")?;
+        let dest = parent.join(&new_name);
+        if dest.exists() {
+            return Err(format!("{new_name} already exists"));
+        }
+        fs::rename(&target, &dest).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn delete_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if is_read_only(&path) {
+            return Err(format!(
+                "{path} is protected by Relay's read-only patterns"
+            ));
+        }
+        let target = PathBuf::from(&path);
+        if !target.exists() {
+            return Err("path does not exist".into());
+        }
+        if target.is_dir() {
+            fs::remove_dir_all(&target).map_err(|e| e.to_string())
+        } else {
+            fs::remove_file(&target).map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// F3 — git status badges for the file tree (docs §3.1: M/A/U/D/C).
+/// Returns repo-relative paths with porcelain codes; not a git repo → empty.
+#[tauri::command]
+pub async fn git_status(root: String) -> Result<Vec<GitStatusEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = std::process::Command::new("git")
+            .args(["-C", &root, "status", "--porcelain", "-z"])
+            .output();
+        let out = match out {
+            Ok(o) if o.status.success() => o,
+            _ => return Ok(vec![]), // git missing or not a repo: no badges
+        };
+        let mut entries = Vec::new();
+        for chunk in out.stdout.split(|b| *b == 0) {
+            // Record format: "XY <path>"; rename records add a second
+            // NUL-separated path field that has no "XY " prefix — skip it.
+            if chunk.len() < 4 || chunk[2] != b' ' {
+                continue;
+            }
+            let code = String::from_utf8_lossy(&chunk[..2]).to_string();
+            let path = String::from_utf8_lossy(&chunk[3..]).to_string();
+            entries.push(GitStatusEntry { path, code });
+        }
+        Ok(entries)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn pick_project_dir() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Select your project folder")
+            .pick_folder()
+            .map(|p| p.display().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Best-effort project metadata for Relay Packets (PRD §6.2 project_context):

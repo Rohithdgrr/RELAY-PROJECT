@@ -103,6 +103,27 @@ fn next_provider(source: &ProviderId, providers: &[ProviderState]) -> ProviderId
         .unwrap_or(ProviderId::Kimi)
 }
 
+impl RelayEngine {
+    /// F1 — mark a provider as the active dock tab and update the registry:
+    /// the active provider becomes 🟢 Active, previously opened ones become
+    /// 🟡 Standby, untouched ones stay ⚪ Not Authenticated.
+    pub fn provider_activated(&self, provider: &str) {
+        let mut session = self.session.lock().unwrap();
+        let Some(id) = ProviderId::from_label(provider) else {
+            return;
+        };
+        for p in session.providers.iter_mut() {
+            if p.id == id {
+                p.status = ProviderStatus::Active;
+                p.last_used = Some(now_iso());
+            } else if p.status != ProviderStatus::NotAuthenticated {
+                p.status = ProviderStatus::Standby;
+            }
+        }
+        session.active_provider = Some(id);
+    }
+}
+
 #[tauri::command]
 pub fn session_status(engine: State<'_, RelayEngine>) -> SessionState {
     engine.session.lock().unwrap().clone()

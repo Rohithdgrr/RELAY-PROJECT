@@ -33,6 +33,16 @@ impl ProviderId {
             ProviderId::Gemini => "Gemini",
         }
     }
+
+    pub fn from_label(s: &str) -> Option<ProviderId> {
+        match s {
+            "chatgpt" => Some(ProviderId::Chatgpt),
+            "kimi" => Some(ProviderId::Kimi),
+            "qwen" => Some(ProviderId::Qwen),
+            "gemini" => Some(ProviderId::Gemini),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

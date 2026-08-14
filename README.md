@@ -14,9 +14,9 @@ session into a portable *Relay Packet* and hands control to the next model.
 | Area | Status |
 |---|---|
 | Tauri v2 + React 19 + TypeScript shell | ✅ working |
-| File explorer (lazy tree, project-root restricted) | ✅ working |
+| File explorer (lazy tree, git badges, context menu, refresh, project-root restricted) | ✅ working |
 | Monaco editor (open/save, dirty tracking, backups) | ✅ working |
-| PTY terminal (portable-pty + xterm.js, event stream, scrollback capture) | ✅ working |
+| PTY terminal (portable-pty + xterm.js, resize sync, exit/restart, Git Bash detection, scrollback capture) | ✅ working |
 | Relay Engine: session store, provider registry, handoff orchestration | ✅ working |
 | Relay Packet generation → `~/.relay/sessions/*.json` | ✅ working |
 | Packet inspector + copy (UI) | ✅ working |

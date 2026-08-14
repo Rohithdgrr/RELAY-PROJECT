@@ -4,11 +4,17 @@
 //! Output streams to the UI via `terminal://output` events and is retained in
 //! a scrollback buffer so the Relay Engine can capture terminal state for
 //! Relay Packets (Complete Docs §7.2C).
+//!
+//! Windows note: the master `PtyPair` MUST stay alive for the life of the
+//! session — it owns the ConPTY `PseudoConsole` handle, and dropping it calls
+//! `ClosePseudoConsole`, which terminates the attached shell. We store the
+//! master in the session and keep it until `kill_terminal`.
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
@@ -17,6 +23,8 @@ use crate::types::TerminalState;
 pub struct TerminalSession {
     pub id: u32,
     pub cwd: String,
+    /// Kept alive for the session — see module docs (ConPTY ownership).
+    master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Last ~64KB of output, for Relay Packet capture.
@@ -43,6 +51,39 @@ pub struct TerminalOutput {
     pub data: String,
 }
 
+#[derive(Serialize, Clone)]
+pub struct TerminalExit {
+    pub id: u32,
+}
+
+/// Pick the user's real shell: `$SHELL` if set, else Git Bash on Windows
+/// (the app is often launched outside a bash environment, so `$SHELL` is
+/// unset), else the platform default.
+fn default_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL") {
+        if !shell.trim().is_empty() {
+            return shell;
+        }
+    }
+    if cfg!(windows) {
+        const CANDIDATES: &[&str] = &[
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+            "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+            "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+            r#"%LOCALAPPDATA%\Programs\Git\bin\bash.exe"#,
+        ];
+        for c in CANDIDATES {
+            let expanded = c.replace("%LOCALAPPDATA%", &std::env::var("LOCALAPPDATA").unwrap_or_default());
+            if Path::new(&expanded).exists() {
+                return expanded;
+            }
+        }
+        "cmd".to_string()
+    } else {
+        "bash".to_string()
+    }
+}
+
 #[tauri::command]
 pub fn spawn_terminal(
     app: AppHandle,
@@ -59,13 +100,7 @@ pub fn spawn_terminal(
         })
         .map_err(|e| e.to_string())?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "cmd".to_string()
-        } else {
-            "bash".to_string()
-        }
-    });
+    let shell = default_shell();
     let mut cmd = CommandBuilder::new(shell);
     if let Some(dir) = &cwd {
         cmd.cwd(dir);
@@ -93,6 +128,7 @@ pub fn spawn_terminal(
         TerminalSession {
             id,
             cwd: cwd.unwrap_or_default(),
+            master: pair.master, // keep the ConPTY / pty alive
             writer,
             child,
             buffer: buffer.clone(),
@@ -100,6 +136,8 @@ pub fn spawn_terminal(
     );
 
     // Reader thread: stream to the frontend + keep the capture buffer.
+    // When the stream ends (shell exit), notify the UI so it can offer a
+    // restart instead of showing a silently dead terminal.
     let app2 = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -125,6 +163,7 @@ pub fn spawn_terminal(
                 }
             }
         }
+        let _ = app2.emit("terminal://exit", TerminalExit { id });
     });
 
     Ok(id)
@@ -140,6 +179,28 @@ pub fn write_stdin(state: State<'_, TerminalManager>, id: u32, data: String) -> 
         .map_err(|e| e.to_string())?;
     session.writer.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Keep the PTY in sync with the xterm.js viewport so line wrapping and full
+/// screen apps (vim, top) behave correctly.
+#[tauri::command]
+pub fn resize_terminal(
+    state: State<'_, TerminalManager>,
+    id: u32,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let sessions = state.sessions.lock().unwrap();
+    let session = sessions.get(&id).ok_or("terminal not found")?;
+    session
+        .master
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
