@@ -262,6 +262,96 @@ pub async fn dock_set_bounds(
     Ok(())
 }
 
+/// F6/F5/F4 — read AI output from the provider page. Remote pages have no IPC
+/// in this Tauri version, so the only channel is `eval_with_callback`: we
+/// evaluate a tiny script in the child webview that runs the preload's
+/// `__relay_scan_dom()` (a shadow-DOM-aware extraction of code blocks,
+/// commands, rate-limit signals). The UI turns those into user-confirmed
+/// [Apply]/[▶ Run] actions.
+#[tauri::command]
+pub async fn dock_scan(
+    dock: State<'_, DockManager>,
+    provider: String,
+) -> Result<Value, String> {
+    let Some(webview) = dock.webviews.lock().unwrap().get(&provider).cloned() else {
+        return Ok(serde_json::json!({ "scanned": false, "provider": provider }));
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let js = r#"JSON.stringify((() => {
+      try {
+        if (typeof window.__relay_scan_dom === "function") return window.__relay_scan_dom();
+        // Preload not visible from this eval context — report DOM facts so
+        // the dock can tell a missing-preload from an empty conversation.
+        return {
+          scanned: false,
+          preload_missing: true,
+          has_relay_state: !!window.__relay_state__,
+          pres: document.querySelectorAll("pre").length,
+        };
+      } catch (e) { return { scanned: false, error: String(e) }; }
+    })())"#;
+    let _ = webview.eval_with_callback(js, move |res| {
+        let _ = tx.send(res);
+    });
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(std::time::Duration::from_millis(3000))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|_| format!("{provider} scan timed out"))?;
+    // Never fail the poll on eval errors — return a partial state so the UI
+    // keeps polling instead of surfacing an error the user can't act on.
+    match serde_json::from_str::<Value>(&res) {
+        Ok(value) => {
+            let msgs = value
+                .get("messages_seen")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let diag = value.get("diag").cloned().unwrap_or(serde_json::json!({}));
+            let missing = value
+                .get("preload_missing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let nodes = diag.get("nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pres = diag.get("pres").and_then(|v| v.as_u64()).unwrap_or(0);
+            let err = diag
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            log_line(&format!(
+                "scan {provider}: {} msgs (nodes={nodes}, pre={pres}{}{})",
+                msgs,
+                if missing { ", preload MISSING" } else { "" },
+                if err.is_empty() { String::new() } else { format!(", err={err}") },
+            ));
+            Ok(value)
+        }
+        Err(_) => Ok(serde_json::json!({
+            "scanned": false,
+            "provider": provider,
+            "error": res,
+        })),
+    }
+}
+
+/// F3 — give the AI read access to the project by filling its input with a
+/// context bundle (file tree + open files). The user reviews and sends it;
+/// Relay never sends on the user's behalf.
+#[tauri::command]
+pub async fn dock_context(
+    app: AppHandle,
+    dock: State<'_, DockManager>,
+    provider: String,
+    text: String,
+) -> Result<(), String> {
+    let webview = get_or_create(&app, &dock, &provider)?;
+    let payload = serde_json::to_string(&text).map_err(|e| e.to_string())?;
+    let js = format!("window.__relay_fill && window.__relay_fill({payload}); 'ok'");
+    webview.eval(js).map_err(|e| e.to_string())?;
+    log_line(&format!("context sent to {provider} ({} chars)", text.len()));
+    Ok(())
+}
+
 /// F2 — assisted handoff injection: recreate the target provider's webview
 /// with the Relay Packet baked into its initialization script. The preload
 /// fills the input field and copies the prompt to the clipboard; the user

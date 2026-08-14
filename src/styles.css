@@ -198,6 +198,54 @@ pre {
   border-bottom: 1px solid var(--border);
   min-height: 16px;
 }
+
+/* ---------- AI actions (Apply / Run) ---------- */
+.dock-actions {
+  max-height: 200px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.action-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.action-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.read-row {
+  flex-wrap: wrap;
+}
+.action-row:last-child {
+  border-bottom: none;
+}
+.action-code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text);
+}
+.rate-limit-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(239, 68, 68, 0.12);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--error);
+}
+.handoff-btn {
+  width: 100%;
+}
 .toast {
   position: fixed;
   bottom: 34px;
@@ -457,6 +505,21 @@ pre {
 .terminal-container .xterm {
   height: 100%;
 }
+.terminal-browser-note {
+  flex: 1;
+  padding: 14px 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  background: var(--bg);
+}
+.terminal-browser-note code {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
 
 /* ---------- AI dock ---------- */
 .provider-list {
@@ -557,6 +620,12 @@ pre {
   color: var(--error);
   padding: 8px 10px;
   font-size: 12px;
+}
+.notice-text {
+  color: var(--accent);
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 .loading {
   padding: 14px;

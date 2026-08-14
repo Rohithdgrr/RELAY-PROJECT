@@ -20,6 +20,7 @@ pub fn run() {
             fs::delete_path,
             fs::git_status,
             fs::pick_project_dir,
+            fs::tree_summary,
             // Relay engine (F2)
             relay::session_status,
             relay::set_project,
@@ -30,10 +31,13 @@ pub fn run() {
             terminal::write_stdin,
             terminal::resize_terminal,
             terminal::kill_terminal,
+            terminal::run_command,
             // Embedded webview dock (F1)
             dock::dock_activate,
             dock::dock_set_bounds,
             dock::dock_inject,
+            dock::dock_scan,
+            dock::dock_context,
             dock::provider_open_window,
         ])
         .run(tauri::generate_context!())

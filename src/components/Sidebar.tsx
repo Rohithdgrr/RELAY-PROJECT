@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listDir, type DirEntry } from "../lib/fs";
+import { listDir, readFile, type DirEntry } from "../lib/fs";
 import { useRelayStore } from "../relay/store";
 
 function fileIcon(name: string): string {
@@ -52,6 +52,8 @@ export default function Sidebar() {
   const openProject = useRelayStore((s) => s.openProject);
   const openFile = useRelayStore((s) => s.openFile);
   const activeFile = useRelayStore((s) => s.activeFile);
+  const treeRevision = useRelayStore((s) => s.treeRevision);
+  const activeProvider = useRelayStore((s) => s.activeProvider);
 
   const [root, setRoot] = useState<DirEntry[] | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
@@ -59,6 +61,7 @@ export default function Sidebar() {
   const [loading, setLoading] = useState<ReadonlySet<string>>(new Set());
   const [git, setGit] = useState<ReadonlyMap<string, string>>(new Map());
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
 
   // Guards against double-firing toggles before state settles.
@@ -120,7 +123,7 @@ export default function Sidebar() {
     return () => {
       cancelled = true;
     };
-  }, [projectPath, loadGit]);
+  }, [projectPath, treeRevision, loadGit]);
 
   // Close the context menu on any outside click.
   useEffect(() => {
@@ -178,7 +181,13 @@ export default function Sidebar() {
   };
 
   const runAction = async (
-    action: "new-file" | "new-folder" | "rename" | "delete" | "copy-path",
+    action:
+      | "new-file"
+      | "new-folder"
+      | "rename"
+      | "delete"
+      | "copy-path"
+      | "send-to-ai",
     entry: DirEntry,
     isDir: boolean
   ) => {
@@ -219,6 +228,29 @@ export default function Sidebar() {
         }
         case "copy-path": {
           await navigator.clipboard.writeText(entry.path);
+          return;
+        }
+        case "send-to-ai": {
+          // User-initiated READ: send this file's contents into the active
+          // provider's input. Relay never reads a file the user did not
+          // explicitly pick (Complete Docs §8.5).
+          if (!activeProvider) {
+            setError("No provider active — open the AI Dock and pick a model first");
+            return;
+          }
+          const content = await readFile(entry.path);
+          const ext = entry.name.split(".").pop() ?? "";
+          const rel = relPath(entry.path);
+          const text = [
+            `## FILE: ${rel}`,
+            `\`\`\`${ext}`,
+            content,
+            "```",
+            "",
+            "Read the file above. Tell me what you'd change or write next.",
+          ].join("\n");
+          await invoke("dock_context", { provider: activeProvider, text });
+          setNotice(`Sent ${rel} to ${activeProvider}'s input — review and send`);
           return;
         }
       }
@@ -320,6 +352,14 @@ export default function Sidebar() {
           </button>
         </div>
       )}
+      {notice && (
+        <div className="notice-text">
+          {notice}
+          <button className="ghost-btn" onClick={() => setNotice(null)}>
+            ✕
+          </button>
+        </div>
+      )}
 
       {!projectPath && (
         <div className="empty-hint">
@@ -375,6 +415,14 @@ export default function Sidebar() {
             📁 New Folder
           </button>
           <div className="context-sep" />
+          {!menu.isDir && (
+            <button
+              className="context-item"
+              onClick={() => runAction("send-to-ai", menu.entry, menu.isDir)}
+            >
+              🤖 Send to AI dock
+            </button>
+          )}
           <button
             className="context-item"
             onClick={() => runAction("rename", menu.entry, menu.isDir)}

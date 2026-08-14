@@ -21,6 +21,7 @@ export default function TerminalPane() {
   const fitRef = useRef<FitAddon | null>(null);
   const idRef = useRef<number | null>(null);
   const [exited, setExited] = useState(false);
+  const [browserMode, setBrowserMode] = useState(false);
 
   // Spawn the shell at the project root (or the app default when none is set).
   const spawn = async (term: Terminal) => {
@@ -46,6 +47,12 @@ export default function TerminalPane() {
   };
 
   useEffect(() => {
+    // Browser preview has no Tauri backend — show a friendly note instead
+    // of a dead xterm pane with raw invoke errors in it.
+    if (!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
+      setBrowserMode(true);
+      return;
+    }
     const container = containerRef.current;
     if (!container) return;
     let disposed = false;
@@ -129,7 +136,15 @@ export default function TerminalPane() {
           </span>
         )}
       </div>
-      <div ref={containerRef} className="terminal-container" />
+      {browserMode ? (
+        <div className="terminal-browser-note">
+          Browser preview: the terminal needs the Relay desktop app (the
+          PTY shell runs in Rust). Launch <code>relay.exe</code> or run{" "}
+          <code>npm run tauri dev</code>.
+        </div>
+      ) : (
+        <div ref={containerRef} className="terminal-container" />
+      )}
     </section>
   );
 }

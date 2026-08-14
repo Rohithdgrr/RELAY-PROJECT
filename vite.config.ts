@@ -11,8 +11,9 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     watch: {
-      // Tell Vite to ignore watching src-tauri
-      ignored: ["**/src-tauri/**"],
+      // Ignore Rust build outputs (noisy churn); keep watching the preload
+      // scripts so dev-time edits to relay-bridge.js are served fresh.
+      ignored: ["**/src-tauri/target/**", "**/src-tauri/gen/**"],
     },
   },
 

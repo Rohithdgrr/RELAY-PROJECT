@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { pickProjectDir, readFile, writeFile } from "../lib/fs";
-import type { RelayPacket, SessionState } from "./types";
+import type { ProviderId, RelayPacket, SessionState } from "./types";
 
 export interface OpenFile {
   path: string;
@@ -16,7 +16,12 @@ interface RelayState {
   activeFile: string | null;
   lastPacket: RelayPacket | null;
   busy: boolean;
+  treeRevision: number;
+  /** Provider whose embedded webview is currently shown (set by the AI dock). */
+  activeProvider: ProviderId | null;
 
+  bumpTree: () => void;
+  setActiveProvider: (p: ProviderId | null) => void;
   openProject: () => Promise<void>;
   openFile: (path: string) => Promise<void>;
   updateActiveFile: (content: string) => void;
@@ -32,6 +37,11 @@ export const useRelayStore = create<RelayState>((set, get) => ({
   activeFile: null,
   lastPacket: null,
   busy: false,
+  treeRevision: 0,
+  activeProvider: null,
+
+  bumpTree: () => set((s) => ({ treeRevision: s.treeRevision + 1 })),
+  setActiveProvider: (p) => set({ activeProvider: p }),
 
   openProject: async () => {
     const dir = await pickProjectDir();

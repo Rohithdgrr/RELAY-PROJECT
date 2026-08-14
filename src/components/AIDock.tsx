@@ -1,9 +1,61 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { readFile, writeFile } from "../lib/fs";
 import { PROVIDERS, STATUS_GLYPH } from "../relay/providers";
 import { useRelayStore } from "../relay/store";
 import type { ProviderId } from "../relay/types";
+
+interface ScanCommand {
+  text: string;
+  lang: string;
+}
+interface ScanFileOp {
+  path: string | null;
+  code: string;
+  lang: string | null;
+}
+interface ScanDiag {
+  selectors?: Record<string, number>;
+  nodes?: number;
+  pres?: number;
+  generic_used?: boolean;
+  error?: string | null;
+}
+interface ScanResult {
+  provider?: string;
+  scanned?: boolean;
+  scan_version?: number;
+  scanned_at?: number;
+  messages_seen?: number;
+  commands?: ScanCommand[];
+  file_ops?: ScanFileOp[];
+  rate_limited?: boolean;
+  last_message?: string;
+  preload_missing?: boolean;
+  /** Set by the fallback payload when the preload isn't visible from eval. */
+  pres?: number;
+  diag?: ScanDiag;
+}
+
+// Commands that warrant an extra warning (Complete Docs §8.4).
+const DESTRUCTIVE_RE =
+  /^(rm|rmdir|del|rd|format|mkfs|dd|shutdown|reboot|sudo|doas|pkexec|:\\(\\)|curl [^|]*\\| (ba)?sh)\\b/i;
+
+const isAbsolutePath = (p: string) =>
+  /^[A-Za-z]:[\\\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\\\");
+const joinPath = (root: string | null, rel: string) =>
+  root
+    ? `${root.replace(/[\\\\/]+$/, "")}\\\\${rel.replace(/^[\\\\/]+/, "")}`
+    : rel;
+
+const inTauri = () =>
+  !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+
+// File paths the AI mentions in its latest message (e.g. "look at src/App.tsx"),
+// offered as one-click reads into the provider's input.
+const FILE_REF_RE =
+  /[\w./\\-]+\\.(?:tsx?|jsx?|json|rs|py|md|css|html|toml|ya?ml|sh|env|txt)\\b/g;
 
 export default function AIDock() {
   const session = useRelayStore((s) => s.session);
@@ -11,24 +63,29 @@ export default function AIDock() {
   const runHandoff = useRelayStore((s) => s.runHandoff);
   const lastPacket = useRelayStore((s) => s.lastPacket);
   const busy = useRelayStore((s) => s.busy);
+  const projectPath = useRelayStore((s) => s.projectPath);
+  const openFiles = useRelayStore((s) => s.openFiles);
+  const bumpTree = useRelayStore((s) => s.bumpTree);
+  const setActiveProvider = useRelayStore((s) => s.setActiveProvider);
 
   const [active, setActive] = useState<ProviderId | null>(null);
   const [activating, setActivating] = useState(false);
   const [dockError, setDockError] = useState<string | null>(null);
-  const [loadState, setLoadState] = useState<Record<string, string>>({});
+  const [scan, setScan] = useState<ScanResult | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const areaRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<number | null>(null);
+  // Browser preview has no Tauri backend: everything below would fail with
+  // opaque errors, so surface one clear banner instead (mirrors the terminal).
+  const [browserMode] = useState(() => !inTauri());
 
   useEffect(() => {
     refreshSession().catch(() => {});
     const unlisteners: UnlistenFn[] = [];
-    // Page-load diagnostics from the embedded webviews.
     listen<[string, string, string]>("relay://dock-load", (e) => {
-      const [prov, evt, url] = e.payload;
-      setLoadState((s) => ({ ...s, [prov]: evt }));
+      const [prov, evt] = e.payload;
       if (evt === "failed") {
-        showToast(`${prov} failed to load (${url}) — check the network or try another provider`);
+        showToast(`${prov} failed to load — check the network or try another provider`);
       }
     }).then((u) => unlisteners.push(u));
     return () => unlisteners.forEach((u) => u());
@@ -70,13 +127,36 @@ export default function AIDock() {
     };
   }, [reportBounds]);
 
+  // Poll the provider page for AI output signals (code blocks, commands,
+  // rate-limit, file references) every 2.5s while a provider is active.
+  useEffect(() => {
+    if (!active || dockError || browserMode) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await invoke<ScanResult>("dock_scan", { provider: active });
+        if (!cancelled) setScan(res);
+      } catch {
+        /* transient — retry on next tick */
+      }
+    };
+    poll();
+    const t = window.setInterval(poll, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [active, dockError, browserMode]);
+
   const activate = async (id: ProviderId) => {
+    setActive(id);
+    setActiveProvider(id);
+    if (browserMode) return; // banner explains why nothing embeds here
     const b = areaBounds();
     if (!b) return;
-    setActive(id);
     setActivating(true);
     setDockError(null);
-    setLoadState((s) => ({ ...s, [id]: "started" }));
+    setScan(null);
     try {
       await invoke("dock_activate", { provider: id, ...b });
       await refreshSession();
@@ -89,6 +169,10 @@ export default function AIDock() {
 
   const relay = async () => {
     if (!active) return;
+    if (browserMode) {
+      showToast("Handoff needs the Relay desktop app — this preview has no backend");
+      return;
+    }
     const b = areaBounds();
     if (!b) return;
     const ok = window.confirm(
@@ -107,20 +191,162 @@ export default function AIDock() {
     try {
       await invoke("dock_inject", { provider: packet.target_model, packet, ...b });
       setActive(packet.target_model as ProviderId);
+      setActiveProvider(packet.target_model as ProviderId);
       await refreshSession();
     } catch (e) {
       setDockError(String(e));
     }
   };
 
+  // ---- AI capabilities (all user-confirmed) ----
+
+  const runCommand = async (cmd: string) => {
+    if (browserMode) {
+      showToast("Running commands needs the Relay desktop app");
+      return;
+    }
+    const trimmed = cmd.trim();
+    const destructive = DESTRUCTIVE_RE.test(trimmed);
+    const ok = destructive
+      ? window.confirm(
+          `⚠️ "${trimmed.split("\n")[0]}" looks destructive.\n\nRun it in the terminal anyway?`
+        )
+      : window.confirm(`Run "${trimmed.split("\n")[0]}" in the terminal?`);
+    if (!ok) return;
+    try {
+      await invoke("run_command", { command: cmd });
+      showToast(`Running: ${trimmed.split("\n")[0]}`);
+    } catch (e) {
+      showToast(String(e));
+    }
+  };
+
+  const applyFileOp = async (op: ScanFileOp) => {
+    let rel = op.path;
+    if (!rel) {
+      rel = window.prompt("Target file (relative to project root):", "");
+      if (!rel) return;
+    }
+    const full = isAbsolutePath(rel) ? rel : joinPath(projectPath, rel);
+    const lines = op.code.split("\n").length;
+    const preview =
+      op.code.length > 400 ? `${op.code.slice(0, 400)}\n…` : op.code;
+    const ok = window.confirm(
+      `Write ${lines} lines to:\n${full}\n\n${preview}\n\nApply?`
+    );
+    if (!ok) return;
+    try {
+      await writeFile(full, op.code);
+      bumpTree();
+      showToast(`Applied ${lines} lines to ${full}`);
+    } catch (e) {
+      showToast(String(e));
+    }
+  };
+
+  // File paths mentioned in the AI's latest message → one-click [📖 Read]
+  // buttons that read the file and send it into the provider's input.
+  const readRequests = useMemo(() => {
+    if (!scan?.last_message || !projectPath) return [];
+    const found: string[] = [];
+    const seen = new Set<string>();
+    const re = new RegExp(FILE_REF_RE.source, "g");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(scan.last_message)) !== null && found.length < 3) {
+      const p = m[0];
+      if (/^\d/.test(p) || seen.has(p)) continue;
+      seen.add(p);
+      found.push(p);
+    }
+    return found;
+  }, [scan, projectPath]);
+
+  const readFileForAI = async (rel: string) => {
+    if (!active || browserMode) {
+      showToast("Reading for the AI needs the Relay desktop app and an active provider");
+      return;
+    }
+    const full = isAbsolutePath(rel) ? rel : joinPath(projectPath, rel);
+    try {
+      const content = await readFile(full);
+      const ext = rel.split(".").pop() ?? "";
+      const text = [
+        `## FILE: ${rel}`,
+        `\`\`\`${ext}`,
+        content,
+        "```",
+        "",
+        "Read the file above. Tell me what you'd change or write next.",
+      ].join("\n");
+      await invoke("dock_context", { provider: active, text });
+      showToast(`Sent ${rel} to ${active}'s input — review and send`);
+    } catch (e) {
+      showToast(String(e));
+    }
+  };
+
+  const sendContext = async () => {
+    if (!active) {
+      showToast("Activate a provider first");
+      return;
+    }
+    if (browserMode) {
+      showToast("Sending context needs the Relay desktop app");
+      return;
+    }
+    if (!projectPath) {
+      showToast("Open a project first");
+      return;
+    }
+    try {
+      const tree = await invoke<string>("tree_summary", {
+        root: projectPath,
+        maxDepth: 3,
+      });
+      const files = openFiles
+        .map((f) => `### ${f.path}\n${f.content.slice(0, 4000)}`)
+        .join("\n\n");
+      const text = [
+        "## PROJECT CONTEXT (for this coding session)",
+        `Project root: ${projectPath}`,
+        "",
+        "### File tree:",
+        tree,
+        files ? `### Open files:\n${files}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      await invoke("dock_context", { provider: active, text });
+      showToast(`Project context sent to ${active}'s input — review and send`);
+    } catch (e) {
+      showToast(String(e));
+    }
+  };
+
   const statusText = () => {
+    if (browserMode) return null;
     if (activating) return `Loading ${active}…`;
     if (dockError) return null;
-    const state = active ? loadState[active] : undefined;
-    if (state === "finished") return `${active} loaded`;
-    if (state === "failed") return `${active} failed to load`;
+    const msgs = scan?.messages_seen ?? 0;
+    if (scan?.preload_missing) {
+      return `scan: preload not visible — ${scan.pres ?? 0} <pre> found on page`;
+    }
+    const d = scan?.diag;
+    if (d?.error) return `scan error: ${d.error}`;
+    if (d && (d.nodes ?? 0) > 0) {
+      const where = d.generic_used ? "generic fallback" : "provider selector";
+      return `scan ok (${where}): ${d.nodes} node(s), ${d.pres} <pre>, ${msgs} message(s)`;
+    }
+    if (scan?.scanned === false) return null;
     return null;
   };
+
+  const hasActions =
+    scan &&
+    !browserMode &&
+    (scan.rate_limited ||
+      (scan.commands && scan.commands.length > 0) ||
+      (scan.file_ops && scan.file_ops.length > 0));
 
   return (
     <aside className="panel aidock">
@@ -149,7 +375,17 @@ export default function AIDock() {
       </div>
 
       <div className="dock-webview" ref={areaRef}>
-        {!active && (
+        {browserMode && (
+          <div className="empty-hint">
+            <p>⚠️ Browser preview has no backend.</p>
+            <p className="hint-sub">
+              The embedded provider webviews, file reads/writes, and the PTY
+              terminal run in Rust. Launch <code>relay.exe</code> or run{" "}
+              <code>npm run tauri dev</code> to use the AI capabilities.
+            </p>
+          </div>
+        )}
+        {!browserMode && !active && (
           <div className="empty-hint">
             <p>Pick a provider tab to load its web interface here.</p>
             <p className="hint-sub">
@@ -164,7 +400,10 @@ export default function AIDock() {
             <button
               className="primary-btn"
               onClick={() =>
-                active && invoke("provider_open_window", { provider: active }).catch((e) => showToast(String(e)))
+                active &&
+                invoke("provider_open_window", { provider: active }).catch((e) =>
+                  showToast(String(e))
+                )
               }
             >
               Open in separate window
@@ -174,21 +413,93 @@ export default function AIDock() {
       </div>
 
       <div className="dock-status">
-        {statusText() ?? (
+        {statusText() ? (
+          <span className="hint-sub">{statusText()}</span>
+        ) : (
           <span className="hint-sub">
-            Assisted handoff (PRD §6.2): context is pre-filled into the next
-            model's input for your review.
+            AI actions appear here: code blocks become Apply/Run buttons you
+            confirm (PRD §6.4-6.6).
           </span>
         )}
       </div>
+
+      {readRequests.length > 0 && (
+        <div className="dock-actions">
+          <div className="action-row read-row">
+            <span className="action-label">AI wants to read:</span>
+            {readRequests.map((p) => (
+              <button
+                key={p}
+                className="ghost-btn"
+                onClick={() => readFileForAI(p)}
+                title={`Read ${p} and send its contents to ${active}`}
+              >
+                📖 {p}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {hasActions && (
+        <div className="dock-actions">
+          {scan!.rate_limited && (
+            <div className="rate-limit-banner">
+              <span>🔴 {active} looks rate-limited</span>
+              <button className="ghost-btn" onClick={relay} disabled={busy}>
+                Relay to next model
+              </button>
+            </div>
+          )}
+          {scan!.commands?.map((c, i) => (
+            <div key={`c${i}`} className="action-row">
+              <code className="action-code" title={c.text}>
+                $ {c.text.split("\n")[0]}
+              </code>
+              <button className="ghost-btn" onClick={() => runCommand(c.text)}>
+                ▶ Run
+              </button>
+              <button
+                className="ghost-btn"
+                onClick={() => navigator.clipboard.writeText(c.text)}
+              >
+                📋
+              </button>
+            </div>
+          ))}
+          {scan!.file_ops?.map((op, i) => (
+            <div key={`f${i}`} className="action-row">
+              <code className="action-code" title={op.code}>
+                {op.path ?? "pick path"} · {op.code.split("\n").length} lines
+              </code>
+              <button className="ghost-btn" onClick={() => applyFileOp(op)}>
+                💾 Apply
+              </button>
+              <button
+                className="ghost-btn"
+                onClick={() => navigator.clipboard.writeText(op.code)}
+              >
+                📋
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="handoff-box">
         <button
           className="primary-btn handoff-btn"
           onClick={relay}
-          disabled={busy || !active || !!dockError}
+          disabled={busy || !active || !!dockError || browserMode}
         >
           {busy ? "Relaying…" : "🔄 Relay to next model"}
+        </button>
+        <button
+          className="ghost-btn handoff-btn"
+          onClick={sendContext}
+          disabled={!active || !!dockError || !projectPath || browserMode}
+        >
+          📋 Send project context to {active ?? "model"}
         </button>
       </div>
 

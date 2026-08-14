@@ -181,6 +181,25 @@ pub fn write_stdin(state: State<'_, TerminalManager>, id: u32, data: String) -> 
     Ok(())
 }
 
+/// F4/AI bridge — execute a command in the active terminal (surfaced from AI
+/// code blocks as user-confirmed [▶ Run] actions). Nothing runs without the
+/// user clicking Run.
+#[tauri::command]
+pub fn run_command(state: State<'_, TerminalManager>, command: String) -> Result<(), String> {
+    let mut sessions = state.sessions.lock().unwrap();
+    let session = sessions
+        .values_mut()
+        .next()
+        .ok_or("no terminal session — restart the terminal first")?;
+    session
+        .writer
+        .write_all(command.as_bytes())
+        .map_err(|e| e.to_string())?;
+    session.writer.write_all(b"\r").map_err(|e| e.to_string())?;
+    session.writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Keep the PTY in sync with the xterm.js viewport so line wrapping and full
 /// screen apps (vim, top) behave correctly.
 #[tauri::command]

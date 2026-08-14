@@ -283,6 +283,58 @@ pub async fn git_status(root: String) -> Result<Vec<GitStatusEntry>, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Compact project tree text for AI context (Complete Docs §3.4 / §10.2D).
+/// Skips the standard exclude dirs and caps the walk so huge repos don't
+/// flood the context window.
+fn tree_summary_blocking(
+    root: &str,
+    max_depth: usize,
+    depth: usize,
+    count: &mut usize,
+    max_nodes: usize,
+) -> Result<String, String> {
+    let mut out = String::new();
+    if depth > max_depth || *count >= max_nodes {
+        return Ok(out);
+    }
+    let entries = list_dir_blocking(root)?;
+    for e in entries {
+        if *count >= max_nodes {
+            out.push_str(&format!("{}… (truncated)\n", "  ".repeat(depth + 1)));
+            break;
+        }
+        *count += 1;
+        out.push_str(&format!(
+            "{}{}{}\n",
+            "  ".repeat(depth + 1),
+            if e.is_dir { "📁 " } else { "   " },
+            e.name
+        ));
+        if e.is_dir {
+            out.push_str(&tree_summary_blocking(&e.path, max_depth, depth + 1, count, max_nodes)?);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn tree_summary(root: String, max_depth: usize) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut count = 0usize;
+        let mut out = format!("📂 {root}\n");
+        out.push_str(&tree_summary_blocking(
+            &root,
+            max_depth.min(6),
+            0,
+            &mut count,
+            300,
+        )?);
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn pick_project_dir() -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(|| {
