@@ -20,9 +20,15 @@ session into a portable *Relay Packet* and hands control to the next model.
 | Relay Engine: session store, provider registry, handoff orchestration | ✅ working |
 | Relay Packet generation → `~/.relay/sessions/*.json` | ✅ working |
 | Packet inspector + copy (UI) | ✅ working |
-| Provider webview windows + stub preload | ⚠️ window opens; DOM bridge is the Phase 1 spike |
-| Multi-signal rate-limit detector → auto-handoff | ⛔ Phase 1 spike (Complete Docs §7.1) |
-| Conversation capture/compaction from webview DOM | ⛔ Phase 1 spike |
+| AI dock: embedded provider webviews (multiwebview) | ✅ working |
+| Scan bridge: shadow-DOM extraction → Apply/Run/Read actions | ✅ working (generic fallback + live diagnostics) |
+| Multi-signal rate-limit detector → relay suggestion | ✅ working (≥2 signals, passive) |
+| Conversation capture → handoff packet (rolling buffer, code changes) | ✅ working |
+| Updateable selector registry (`~/.relay/selectors.json`) | ✅ working |
+| Handoff injection into target model input (assisted) | ✅ working (pre-fill, user reviews) |
+| Command palette (Ctrl+K), global shortcuts | ✅ working |
+| Clickable/closable editor tabs, project search (Ctrl+Shift+F), diff preview before Apply | ✅ working |
+| Recent projects + session restore, terminal paste/clear/wrap, enriched status bar, explorer filter | ✅ working |
 
 ## Run it
 
@@ -45,7 +51,8 @@ src-tauri/src/
   relay.rs      Relay Engine: session store + handoff orchestration
   terminal.rs   PTY manager (portable-pty) with scrollback capture
   fs.rs         File bridge: read/write, read-only patterns, backups, atomic writes
-src-tauri/preloads/relay-bridge.js   provider preload stub (passive observation only)
+src-tauri/preloads/relay-bridge.js   provider bridge: scan, fill, rate-limit, rolling buffer
+src-tauri/src/selectors.rs           updateable selector registry (bundled defaults)
 src/
   relay/        types, provider registry, zustand store
   components/   header, sidebar, editor, terminal, AI dock, status bar
@@ -57,9 +64,13 @@ src/
   idiomatic Tauri choice, no Node sidecar. xterm.js on the frontend is
   unchanged. Recorded in both docs' changelogs.
 - **Compliance stance (Complete Docs §8.5):** Relay is *assisted-only*. The
-  stub preload only observes the page; it never sends messages and never evades
-  bot detection. Provider webview windows have **no Tauri capability**, so a
-  compromised provider page cannot reach IPC — enforced by configuration.
+  preload only observes the page; it never sends messages and never evades bot
+  detection. Provider webviews have **no Tauri capability**, so a compromised
+  provider page cannot reach IPC — enforced by configuration.
+- **Selector registry:** provider DOM is volatile, so selectors ship in
+  `~/.relay/selectors.json` (written from bundled defaults on first run).
+  Edit it when a provider reworks its markup and switch provider tabs — no
+  app rebuild needed. A malformed file falls back to bundled defaults.
 
 ## Roadmap pointers
 

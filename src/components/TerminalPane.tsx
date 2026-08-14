@@ -22,6 +22,9 @@ export default function TerminalPane() {
   const idRef = useRef<number | null>(null);
   const [exited, setExited] = useState(false);
   const [browserMode, setBrowserMode] = useState(false);
+  const [lineWrap, setLineWrap] = useState(true);
+  const terminalFocus = useRelayStore((s) => s.terminalFocus);
+  const setTerminalAlive = useRelayStore((s) => s.setTerminalAlive);
 
   // Spawn the shell at the project root (or the app default when none is set).
   const spawn = async (term: Terminal) => {
@@ -30,6 +33,7 @@ export default function TerminalPane() {
       const id = await invoke<number>("spawn_terminal", { cwd });
       idRef.current = id;
       setExited(false);
+      setTerminalAlive(true);
       // Push the current viewport size to the freshly spawned PTY (the
       // onResize hook may have fired before the spawn resolved).
       const dims = fitRef.current?.proposeDimensions();
@@ -43,6 +47,7 @@ export default function TerminalPane() {
     } catch (e) {
       term.write(`\r\n\x1b[31mPTY error: ${e}\x1b[0m\r\n`);
       setExited(true);
+      setTerminalAlive(false);
     }
   };
 
@@ -93,7 +98,10 @@ export default function TerminalPane() {
     }).then((u) => unlisteners.push(u));
 
     listen<TerminalExit>("terminal://exit", (event) => {
-      if (event.payload.id === idRef.current) setExited(true);
+      if (event.payload.id === idRef.current) {
+        setExited(true);
+        setTerminalAlive(false);
+      }
     }).then((u) => unlisteners.push(u));
 
     spawn(term);
@@ -103,6 +111,7 @@ export default function TerminalPane() {
 
     return () => {
       disposed = true;
+      setTerminalAlive(false);
       window.removeEventListener("resize", onResize);
       unlisteners.forEach((u) => u());
       // Clean up the PTY (kills the shell) so nothing leaks across remounts.
@@ -111,7 +120,41 @@ export default function TerminalPane() {
       }
       term.dispose();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Track shell liveness for the status bar; keep the PTY state truthful.
+  useEffect(() => {
+    if (browserMode) return;
+    if (idRef.current != null) setTerminalAlive(!exited);
+  }, [exited, browserMode, setTerminalAlive]);
+
+  // Focus requested from the status bar / palette (Ctrl+`).
+  useEffect(() => {
+    if (terminalFocus > 0) termRef.current?.focus();
+  }, [terminalFocus]);
+
+  const pasteClipboard = async () => {
+    if (browserMode || idRef.current == null) return;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        await invoke("write_stdin", { id: idRef.current, data: text }).catch(() => {});
+      }
+    } catch {
+      /* clipboard blocked — ignore */
+    }
+  };
+
+  const toggleWrap = () => {
+    setLineWrap((prev) => {
+      const next = !prev;
+      if (termRef.current) {
+        (termRef.current.options as { lineWrap?: boolean }).lineWrap = next;
+      }
+      return next;
+    });
+  };
 
   const restart = () => {
     if (idRef.current != null) {
@@ -126,15 +169,33 @@ export default function TerminalPane() {
     <section className="panel terminal-pane">
       <div className="panel-title">
         <span>Terminal</span>
-        {exited ? (
-          <button className="ghost-btn" onClick={restart}>
-            ↻ Restart shell
-          </button>
-        ) : (
-          <span className="hint-sub">
-            commands require your confirmation (PRD §11)
-          </span>
-        )}
+        <div className="title-actions">
+          {!browserMode && (
+            <>
+              <button className="ghost-btn" title="Line wrap" onClick={toggleWrap}>
+                {lineWrap ? "⤶ wrap" : "⤹ nowrap"}
+              </button>
+              <button
+                className="ghost-btn"
+                title="Clear viewport"
+                onClick={() => termRef.current?.clear()}
+              >
+                🧹
+              </button>
+            </>
+          )}
+          {exited ? (
+            <button className="ghost-btn" onClick={restart}>
+              ↻ Restart shell
+            </button>
+          ) : (
+            !browserMode && (
+              <span className="hint-sub">
+                right-click paste · commands need your confirmation (PRD §11)
+              </span>
+            )
+          )}
+        </div>
       </div>
       {browserMode ? (
         <div className="terminal-browser-note">
@@ -143,7 +204,14 @@ export default function TerminalPane() {
           <code>npm run tauri dev</code>.
         </div>
       ) : (
-        <div ref={containerRef} className="terminal-container" />
+        <div
+          ref={containerRef}
+          className="terminal-container"
+          onContextMenu={(e) => {
+            e.preventDefault();
+            pasteClipboard();
+          }}
+        />
       )}
     </section>
   );

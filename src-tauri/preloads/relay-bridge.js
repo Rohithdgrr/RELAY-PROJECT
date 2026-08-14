@@ -1,4 +1,4 @@
-// Relay provider bridge — v0.3.
+// Relay provider bridge — v0.4.
 //
 // Security posture (Complete Docs §8.1 / §8.5): provider pages are remote
 // third-party sites with NO Tauri IPC, so a compromised provider page cannot
@@ -17,39 +17,65 @@
 //   HANDOFF → the host bakes __RELAY_INJECT__ = {provider, prompt} into this
 //             script at webview creation; the input is pre-filled for review.
 //
-// Diagnostics: every scan returns a `diag` object (selector match counts, pre
-// element count, errors) so the dock UI can show *why* a provider yields no
-// actions instead of silently showing nothing.
+// Selector registry: the host injects window.__RELAY_SELECTORS__ (loaded from
+// ~/.relay/selectors.json, updateable without an app rebuild). The values
+// here are merged over it, so a registry entry replaces the default.
+//
+// Rate-limit detection is multi-signal and passive (runs inside the existing
+// scan poll, never aggressive): text phrases + disabled input + disabled send
+// button + error toast, with >= 2 signals required.
 (() => {
   if (window.__RELAY_BRIDGE__) return;
 
   const INJECT = window.__RELAY_INJECT__ || null;
   const provider = INJECT ? INJECT.provider : null;
 
-  // Provider input selectors (PRD appendix A — volatile, community maintained).
-  const SELECTORS = {
-    chatgpt: "#prompt-textarea",
-    kimi: "textarea[placeholder*='输入']",
-    qwen: "#chat-input",
-    gemini: "div.ql-editor[contenteditable='true'], textarea[placeholder], rich-textarea, .ql-editor",
+  // Bundled defaults — superseded by the host-injected registry.
+  const DEFAULT_SELECTORS = {
+    chatgpt: {
+      input: ["#prompt-textarea"],
+      assistant: ["[data-message-author-role='assistant']"],
+    },
+    kimi: {
+      input: ["textarea[placeholder*='输入']"],
+      assistant: [".chat-message-assistant", "[class*='chat-message-assistant']"],
+    },
+    qwen: {
+      input: ["#chat-input"],
+      assistant: [".message-bot", "[class*='message-bot']"],
+    },
+    gemini: {
+      input: ["div.ql-editor[contenteditable='true']", "textarea[placeholder]", "rich-textarea"],
+      assistant: [
+        "model-response", "message-content", "model-response-text",
+        ".model-response-text", ".response-container", "[class*='response']",
+      ],
+    },
   };
 
-  // Provider assistant-message selectors (docs §16 appendix A — volatile).
-  // If none of these match, scan() falls back to a generic semantic selector
-  // list below, so code blocks still surface when a provider reworks its DOM.
-  const ASSISTANT_SELECTORS = {
-    chatgpt: "[data-message-author-role='assistant']",
-    kimi: ".chat-message-assistant, [class*='chat-message-assistant'], [data-message-type='assistant']",
-    qwen: ".message-bot, [class*='message-bot'], [data-role='assistant']",
-    gemini:
-      "model-response, message-content, model-response-text, " +
-      ".model-response-text, .response-container, .conversation-container " +
-      "[class*='response'], [data-test-id*='response']",
-  };
+  // Merge the host registry over the defaults (registry wins per key).
+  const REGISTRY = (() => {
+    const r = JSON.parse(JSON.stringify(DEFAULT_SELECTORS));
+    const ext = window.__RELAY_SELECTORS__;
+    if (ext && ext.providers) {
+      for (const [prov, sel] of Object.entries(ext.providers)) {
+        if (!r[prov]) r[prov] = {};
+        if (Array.isArray(sel.input)) r[prov].input = sel.input;
+        if (Array.isArray(sel.assistant)) r[prov].assistant = sel.assistant;
+      }
+    }
+    return r;
+  })();
+
+  const inputSelectors = () =>
+    (REGISTRY[provider] && REGISTRY[provider].input) ||
+    ["textarea", "[contenteditable='true']"];
+  const assistantSelectors = () =>
+    (REGISTRY[provider] && REGISTRY[provider].assistant) || [];
 
   // Generic fallback — matches any container that plausibly holds AI output:
   // code blocks, message/response containers, markdown bodies. Used when the
-  // provider-specific selector finds nothing.
+  // provider-specific selectors find nothing.
   const GENERIC_SELECTORS =
     "pre, code, [class*='code'], [class*='response'], [class*='message'], " +
     "[class*='assistant'], .markdown, .prose, [data-message-author-role]";
@@ -57,14 +83,18 @@
   const RATE_LIMIT_HINTS = [
     "You've reached your limit",
     "Too many requests",
+    "rate limit",
     "请求过于频繁",
     "请求太频繁",
     "请稍后再试",
+    "已达到使用限制",
   ];
   const COMMAND_LANGS = new Set([
     "bash", "sh", "shell", "zsh", "powershell", "pwsh", "cmd", "console",
   ]);
   const MAX_ACTIONS = 20;
+  const MAX_RECENT = 8;   // rolling conversation buffer (handoff packet)
+  const MAX_MSG_LEN = 6000;
   // Messages shorter than this are UI chrome, not model output.
   const MIN_MSG_LEN = 20;
 
@@ -85,13 +115,15 @@
   // ---- scan state, refreshed by the host on every poll ----
   const state = {
     provider,
-    scan_version: 4,
+    scan_version: 5,
     scanned_at: 0,
     messages_seen: 0,
     commands: [],   // { text, lang }
     file_ops: [],   // { path, code, lang }  (path may be null)
     rate_limited: false,
+    rate_limit_signals: [],
     last_message: "",
+    recent: [],     // rolling buffer: [{ text }]
     diag: null,
   };
   window.__relay_state__ = state;
@@ -115,6 +147,15 @@
     };
     walk(document, 0);
     return found;
+  };
+
+  // Try each selector in the list; first non-empty wins.
+  const collectAny = (sels) => {
+    for (const sel of sels) {
+      const found = collect(sel);
+      if (found.length) return found;
+    }
+    return [];
   };
 
   const seenCodes = new Set();
@@ -180,17 +221,46 @@
     }
   };
 
+  // Multi-signal rate-limit detection (passive, runs inside the scan poll).
+  // Requires >= 2 signals for high confidence (review §"Rate Limit Detection").
+  const detectRateLimit = () => {
+    const signals = [];
+    const pageText = (document.body ? document.body.innerText : "").toLowerCase();
+    if (RATE_LIMIT_HINTS.some((h) => pageText.includes(h.toLowerCase()))) {
+      signals.push("text");
+    }
+    const inputs = document.querySelectorAll(
+      "textarea, input[type='text'], [contenteditable='true']"
+    );
+    if (inputs.length > 0 && Array.from(inputs).every((i) => i.disabled)) {
+      signals.push("input_disabled");
+    }
+    const sendButtons = Array.from(document.querySelectorAll("button")).filter((b) => {
+      const label = ((b.innerText || "") + " " + (b.getAttribute && b.getAttribute("aria-label") || "")).toLowerCase();
+      return /send|submit|发送|提问/.test(label);
+    });
+    if (sendButtons.length > 0 && sendButtons.every((b) => b.disabled)) {
+      signals.push("send_disabled");
+    }
+    const toastText = Array.from(
+      document.querySelectorAll("[role='alert'], [role='status'], .toast, .banner, [data-testid*='error']")
+    )
+      .map((t) => t.innerText || "")
+      .join(" ")
+      .toLowerCase();
+    if (toastText && RATE_LIMIT_HINTS.some((h) => toastText.includes(h.toLowerCase()))) {
+      signals.push("toast");
+    }
+    return { triggered: signals.length >= 2, signals };
+  };
+
   // Called by the host (Rust eval_with_callback) on every poll. Walks the
   // current DOM fresh — no MutationObserver, no stale state — and returns the
   // newest extraction plus diagnostics.
   const scan = () => {
     const diag = { selectors: {}, nodes: 0, pres: 0, generic_used: false, error: null };
-    const sel = ASSISTANT_SELECTORS[provider];
-    let nodes = [];
-    if (sel) {
-      nodes = collect(sel);
-      diag.selectors.assistant = nodes.length;
-    }
+    let nodes = collectAny(assistantSelectors());
+    diag.selectors.assistant = nodes.length;
     if (!nodes.length) {
       nodes = collect(GENERIC_SELECTORS);
       diag.generic_used = true;
@@ -201,16 +271,15 @@
 
     const commands = [];
     const file_ops = [];
+    const msgTexts = [];
     seenCodes.clear();
-    let seen = 0;
     let rate_limited = false;
     let last_message = "";
     for (const n of nodes) {
       const text = (n.textContent || "").trim();
       if (text.length < MIN_MSG_LEN) continue;
-      seen += 1;
-      last_message = text.slice(0, 6000);
-      if (!rate_limited) rate_limited = RATE_LIMIT_HINTS.some((h) => text.includes(h));
+      msgTexts.push(text);
+      last_message = text.slice(0, MAX_MSG_LEN);
       try {
         extractCodeBlocks(text, commands, file_ops);
         extractPreBlocks(n, commands, file_ops);
@@ -218,10 +287,22 @@
         diag.error = String(e);
       }
     }
+
+    // Rolling conversation buffer (dedupe consecutive repeats).
+    for (const text of msgTexts) {
+      const last = state.recent[state.recent.length - 1];
+      if (last && last.text === text) continue;
+      state.recent.push({ text: text.slice(0, MAX_MSG_LEN) });
+      if (state.recent.length > MAX_RECENT) state.recent.shift();
+    }
+
+    const rl = detectRateLimit();
+
     state.commands = commands;
     state.file_ops = file_ops;
-    state.messages_seen = seen;
-    state.rate_limited = rate_limited;
+    state.messages_seen = msgTexts.length;
+    state.rate_limited = rl.triggered;
+    state.rate_limit_signals = rl.signals;
     state.last_message = last_message;
     state.scanned_at = Date.now();
     state.diag = diag;
@@ -232,8 +313,8 @@
   // ---- input fill: used by injection AND "send project context / file" ----
   window.__relay_fill = (text) => {
     if (!text) return false;
-    const sel = SELECTORS[provider] || "textarea, [contenteditable='true'], rich-textarea";
-    const doFill = (input) => {
+    const sels = inputSelectors();
+    const tryFill = (input) => {
       const proto = input instanceof HTMLTextAreaElement
         ? HTMLTextAreaElement.prototype
         : HTMLDivElement.prototype;
@@ -247,14 +328,20 @@
       banner("Relay context loaded — review, then press Enter to send", false);
       return true;
     };
-    const input = document.querySelector(sel);
-    if (input) return doFill(input);
+    for (const sel of sels) {
+      const input = document.querySelector(sel);
+      if (input) return tryFill(input);
+    }
+    // Fall back to the first editable on the page, then retry briefly.
+    const anyInput = document.querySelector("textarea, [contenteditable='true']");
+    if (anyInput) return tryFill(anyInput);
     let tries = 0;
     const wait = setInterval(() => {
-      const el = document.querySelector(sel);
+      const el = document.querySelector(sels.join(",")) ||
+        document.querySelector("textarea, [contenteditable='true']");
       if (el) {
         clearInterval(wait);
-        doFill(el);
+        tryFill(el);
       } else if (++tries > 25) {
         clearInterval(wait);
         banner("Could not find the input field — context copied, paste with Ctrl+V", true);

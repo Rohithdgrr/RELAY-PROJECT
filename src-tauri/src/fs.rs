@@ -347,6 +347,100 @@ pub async fn pick_project_dir() -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+pub struct SearchHit {
+    pub path: String,
+    pub line: usize,
+    pub text: String,
+}
+
+/// Recursive case-insensitive grep over the project tree (UI feature #4).
+/// Skips the standard exclude dirs, caps file size and result count so huge
+/// repos stay responsive, and only matches UTF-8 text files.
+fn search_blocking(
+    root: &Path,
+    query: &str,
+    max_results: usize,
+    out: &mut Vec<SearchHit>,
+) -> Result<(), String> {
+    if out.len() >= max_results {
+        return Ok(());
+    }
+    let entries = list_dir_blocking(&root.display().to_string())?;
+    for e in entries {
+        if out.len() >= max_results {
+            return Ok(());
+        }
+        if e.is_dir {
+            if EXCLUDE_DIRS.contains(&e.name.as_str()) {
+                continue;
+            }
+            search_blocking(Path::new(&e.path), query, max_results, out)?;
+            continue;
+        }
+        // Skip oversized and clearly non-text files.
+        let Ok(meta) = fs::metadata(&e.path) else { continue };
+        if meta.len() > 1024 * 1024 {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&e.path) else { continue };
+        let lower = query.to_lowercase();
+        for (i, line) in content.lines().enumerate() {
+            if line.to_lowercase().contains(&lower) {
+                out.push(SearchHit {
+                    path: e.path.clone(),
+                    line: i + 1,
+                    text: line.trim().chars().take(200).collect(),
+                });
+                if out.len() >= max_results {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn search_files(
+    root: String,
+    query: String,
+    max_results: Option<usize>,
+) -> Result<Vec<SearchHit>, String> {
+    if query.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        search_blocking(
+            Path::new(&root),
+            &query,
+            max_results.unwrap_or(200).min(500),
+            &mut out,
+        )?;
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Current git branch of a project (UI feature #8), "" when not a repo.
+#[tauri::command]
+pub fn git_branch(root: String) -> Result<String, String> {
+    if root.is_empty() {
+        return Ok(String::new());
+    }
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Best-effort project metadata for Relay Packets (PRD §6.2 project_context):
 /// currently parses `package.json` dependencies; Cargo.toml / requirements.txt
 /// awareness is planned (Complete Docs §3.4).

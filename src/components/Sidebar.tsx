@@ -63,6 +63,9 @@ export default function Sidebar() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
+  const [filter, setFilter] = useState("");
+  const [flatMatches, setFlatMatches] = useState<DirEntry[] | null>(null);
+  const recentProjects = useRelayStore((s) => s.recentProjects);
 
   // Guards against double-firing toggles before state settles.
   const inflight = useRef<Set<string>>(new Set());
@@ -124,6 +127,53 @@ export default function Sidebar() {
       cancelled = true;
     };
   }, [projectPath, treeRevision, loadGit]);
+
+  // Flat filtered results: walk the lazy tree (depth-capped) and show matching
+  // files with their paths — predictable, no tree-state surgery.
+  useEffect(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q || !projectPath) {
+      setFlatMatches(null);
+      return;
+    }
+    let cancelled = false;
+    const walk = async (
+      dir: string,
+      depth: number,
+      out: DirEntry[]
+    ): Promise<DirEntry[]> => {
+      if (cancelled || depth > 5 || out.length >= 100) return out;
+      let list: DirEntry[] = [];
+      try {
+        list = await listDir(dir);
+      } catch {
+        return out;
+      }
+      for (const e of list) {
+        if (cancelled || out.length >= 100) return out;
+        if (e.name.toLowerCase().includes(q)) out.push(e);
+        if (e.is_dir) await walk(e.path, depth + 1, out);
+      }
+      return out;
+    };
+    walk(projectPath, 0, []).then((r) => {
+      if (!cancelled) setFlatMatches(r);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [filter, projectPath, treeRevision]);
+
+  const openRecent = async (dir: string) => {
+    try {
+      await invoke("set_project", { path: dir });
+      useRelayStore.setState({ projectPath: dir });
+      useRelayStore.getState().addRecentProject(dir);
+      await useRelayStore.getState().refreshSession();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   // Close the context menu on any outside click.
   useEffect(() => {
@@ -326,16 +376,25 @@ export default function Sidebar() {
         <span>Explorer</span>
         <div className="title-actions">
           {projectPath && (
-            <button
-              className="ghost-btn"
-              title="Refresh"
-              onClick={() => {
-                refreshDir(projectPath);
-                loadGit(projectPath);
-              }}
-            >
-              ↻
-            </button>
+            <>
+              <button
+                className="ghost-btn"
+                title="Collapse all"
+                onClick={() => setExpanded(new Set())}
+              >
+                ⤢
+              </button>
+              <button
+                className="ghost-btn"
+                title="Refresh"
+                onClick={() => {
+                  refreshDir(projectPath);
+                  loadGit(projectPath);
+                }}
+              >
+                ↻
+              </button>
+            </>
           )}
           <button className="ghost-btn" onClick={openProject} disabled={busy}>
             {projectPath ? "Switch" : "Open Project"}
@@ -344,6 +403,14 @@ export default function Sidebar() {
       </div>
 
       {projectPath && <div className="project-name">{projectPath}</div>}
+      {projectPath && (
+        <input
+          className="filter-input"
+          placeholder="Filter files…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+      )}
       {error && (
         <div className="error-text">
           {error}
@@ -367,13 +434,54 @@ export default function Sidebar() {
           <button className="primary-btn" onClick={openProject} disabled={busy}>
             Open a project folder
           </button>
+          {recentProjects.length > 0 && (
+            <div className="recent-list">
+              <p className="hint-sub">Recent:</p>
+              {recentProjects.map((dir) => (
+                <button
+                  key={dir}
+                  className="recent-item"
+                  title={dir}
+                  onClick={() => openRecent(dir)}
+                >
+                  📂 {dir.split(/[\\/]/).pop()}
+                </button>
+              ))}
+            </div>
+          )}
           <p className="hint-sub">
             Relay restricts file access to this folder (PRD §11).
           </p>
         </div>
       )}
 
-      {projectPath && (
+      {projectPath && filter.trim() && (
+        <div className="tree filter-results">
+          {flatMatches === null ? (
+            <div className="loading">Filtering…</div>
+          ) : flatMatches.length === 0 ? (
+            <div className="loading">No matches</div>
+          ) : (
+            flatMatches.map((m) => (
+              <button
+                key={m.path}
+                className={`tree-item ${m.path === activeFile ? "active" : ""}`}
+                style={{ paddingLeft: "10px" }}
+                title={m.path}
+                onClick={() => (m.is_dir ? setFilter("") : open(m))}
+              >
+                <span className="tree-icon">
+                  {m.is_dir ? "📁" : fileIcon(m.name)}
+                </span>
+                <span className="tree-name">{m.name}</span>
+                <span className="filter-path">{relPath(m.path)}</span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+
+      {projectPath && !filter.trim() && (
         <div
           className="tree"
           onContextMenu={(e) => {

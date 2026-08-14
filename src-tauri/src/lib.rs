@@ -1,6 +1,7 @@
 mod dock;
 mod fs;
 mod relay;
+mod selectors;
 mod terminal;
 mod types;
 
@@ -9,6 +10,12 @@ pub fn run() {
         .manage(relay::RelayEngine::default())
         .manage(terminal::TerminalManager::default())
         .manage(dock::DockManager::default())
+        // Write the updateable selector registry on first run so users can
+        // patch provider selectors without an app update.
+        .setup(|_| {
+            selectors::ensure_registry_file();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // File system (F3 / F5)
             fs::list_dir,
@@ -19,8 +26,10 @@ pub fn run() {
             fs::rename_path,
             fs::delete_path,
             fs::git_status,
+            fs::git_branch,
             fs::pick_project_dir,
             fs::tree_summary,
+            fs::search_files,
             // Relay engine (F2)
             relay::session_status,
             relay::set_project,

@@ -25,3 +25,15 @@ export const renamePath = (path: string, newName: string) =>
 export const deletePath = (path: string) => invoke<void>("delete_path", { path });
 export const gitStatus = (root: string) => invoke<GitStatusEntry[]>("git_status", { root });
 export const pickProjectDir = () => invoke<string | null>("pick_project_dir");
+
+export interface SearchHit {
+  path: string;
+  line: number;
+  text: string;
+}
+export const searchFiles = (
+  root: string,
+  query: string,
+  maxResults?: number
+) => invoke<SearchHit[]>("search_files", { root, query, maxResults });
+export const gitBranch = (root: string) => invoke<string>("git_branch", { root });

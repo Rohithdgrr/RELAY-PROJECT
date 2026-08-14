@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DiffEditor } from "@monaco-editor/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { readFile, writeFile } from "../lib/fs";
@@ -52,6 +53,25 @@ const joinPath = (root: string | null, rel: string) =>
 const inTauri = () =>
   !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 
+const LANG_BY_EXT: Record<string, string> = {
+  ts: "typescript",
+  tsx: "typescript",
+  js: "javascript",
+  jsx: "javascript",
+  json: "json",
+  rs: "rust",
+  py: "python",
+  go: "go",
+  md: "markdown",
+  html: "html",
+  css: "css",
+};
+const diffLang = (lang: string | null, rel: string): string => {
+  if (lang && LANG_BY_EXT[lang]) return LANG_BY_EXT[lang];
+  const ext = rel.split(".").pop()?.toLowerCase() ?? "";
+  return LANG_BY_EXT[ext] ?? "plaintext";
+};
+
 // File paths the AI mentions in its latest message (e.g. "look at src/App.tsx"),
 // offered as one-click reads into the provider's input.
 const FILE_REF_RE =
@@ -67,12 +87,22 @@ export default function AIDock() {
   const openFiles = useRelayStore((s) => s.openFiles);
   const bumpTree = useRelayStore((s) => s.bumpTree);
   const setActiveProvider = useRelayStore((s) => s.setActiveProvider);
+  const requestedProvider = useRelayStore((s) => s.requestedProvider);
+  const clearRequestedProvider = useRelayStore((s) => s.clearRequestedProvider);
 
   const [active, setActive] = useState<ProviderId | null>(null);
   const [activating, setActivating] = useState(false);
   const [dockError, setDockError] = useState<string | null>(null);
   const [scan, setScan] = useState<ScanResult | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [diffTarget, setDiffTarget] = useState<{
+    full: string;
+    rel: string;
+    code: string;
+    original: string;
+    lang: string | null;
+  } | null>(null);
+  const [diffApplying, setDiffApplying] = useState(false);
   const areaRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<number | null>(null);
   // Browser preview has no Tauri backend: everything below would fail with
@@ -81,6 +111,7 @@ export default function AIDock() {
 
   useEffect(() => {
     refreshSession().catch(() => {});
+    if (browserMode) return; // no Tauri event bus in a plain browser
     const unlisteners: UnlistenFn[] = [];
     listen<[string, string, string]>("relay://dock-load", (e) => {
       const [prov, evt] = e.payload;
@@ -90,7 +121,7 @@ export default function AIDock() {
     }).then((u) => unlisteners.push(u));
     return () => unlisteners.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshSession]);
+  }, [refreshSession, browserMode]);
 
   const statusFor = (id: string) =>
     session?.providers.find((p) => p.id === id)?.status ?? "not_authenticated";
@@ -167,6 +198,15 @@ export default function AIDock() {
     }
   };
 
+  // Status bar / palette requested a provider switch → activate that tab.
+  useEffect(() => {
+    if (requestedProvider && requestedProvider !== active) {
+      activate(requestedProvider);
+    }
+    clearRequestedProvider();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedProvider]);
+
   const relay = async () => {
     if (!active) return;
     if (browserMode) {
@@ -221,6 +261,8 @@ export default function AIDock() {
     }
   };
 
+  // Diff preview before applying an AI write (Complete Docs §8.4 mandates a
+  // review step) — replaced the old confirm dialog.
   const applyFileOp = async (op: ScanFileOp) => {
     let rel = op.path;
     if (!rel) {
@@ -228,19 +270,28 @@ export default function AIDock() {
       if (!rel) return;
     }
     const full = isAbsolutePath(rel) ? rel : joinPath(projectPath, rel);
-    const lines = op.code.split("\n").length;
-    const preview =
-      op.code.length > 400 ? `${op.code.slice(0, 400)}\n…` : op.code;
-    const ok = window.confirm(
-      `Write ${lines} lines to:\n${full}\n\n${preview}\n\nApply?`
-    );
-    if (!ok) return;
+    let original = "";
     try {
-      await writeFile(full, op.code);
+      original = await readFile(full);
+    } catch {
+      original = ""; // new file
+    }
+    setDiffTarget({ full, rel, code: op.code, original, lang: op.lang });
+  };
+
+  const confirmDiff = async () => {
+    if (!diffTarget) return;
+    setDiffApplying(true);
+    try {
+      await writeFile(diffTarget.full, diffTarget.code);
       bumpTree();
-      showToast(`Applied ${lines} lines to ${full}`);
+      const lines = diffTarget.code.split("\n").length;
+      showToast(`Applied ${lines} lines to ${diffTarget.full}`);
+      setDiffTarget(null);
     } catch (e) {
       showToast(String(e));
+    } finally {
+      setDiffApplying(false);
     }
   };
 
@@ -390,7 +441,9 @@ export default function AIDock() {
             <p>Pick a provider tab to load its web interface here.</p>
             <p className="hint-sub">
               Log in once — cookies persist across restarts. Provider pages
-              have no access to your machine (Complete Docs §8.1).
+              have no access to your machine (Complete Docs §8.1). If a
+              provider changes its DOM, patch selectors in{" "}
+              <code>~/.relay/selectors.json</code> (no rebuild needed).
             </p>
           </div>
         )}
@@ -519,6 +572,55 @@ export default function AIDock() {
             </button>
           </div>
           <pre className="packet-json">{JSON.stringify(lastPacket, null, 2)}</pre>
+        </div>
+      )}
+
+      {diffTarget && (
+        <div className="diff-overlay" onMouseDown={() => setDiffTarget(null)}>
+          <div className="diff-modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="diff-head">
+              <div>
+                <strong>Review change</strong>
+                <span className="hint-sub">
+                  {" "}
+                  {diffTarget.rel} · {diffTarget.code.split("\n").length} lines (
+                  {diffTarget.original ? "modified" : "new file"})
+                </span>
+              </div>
+              <button className="ghost-btn" onClick={() => setDiffTarget(null)}>
+                ✕
+              </button>
+            </div>
+            <div className="diff-body">
+              <DiffEditor
+                original={diffTarget.original}
+                modified={diffTarget.code}
+                theme="vs-dark"
+                language={diffLang(diffTarget.lang, diffTarget.rel)}
+                options={{
+                  readOnly: true,
+                  renderSideBySide: true,
+                  automaticLayout: true,
+                  fontSize: 12,
+                }}
+              />
+            </div>
+            <div className="diff-actions">
+              <button
+                className="ghost-btn"
+                onClick={() => setDiffTarget(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-btn"
+                onClick={confirmDiff}
+                disabled={diffApplying}
+              >
+                {diffApplying ? "Applying…" : "Apply change"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </aside>

@@ -120,18 +120,23 @@ fn injection_prompt(packet: &Value) -> String {
     )
 }
 
-/// The preload script, optionally carrying an injection payload.
+/// The preload script, optionally carrying an injection payload. Always
+/// injects the updateable selector registry (user-editable at
+/// `~/.relay/selectors.json`) ahead of the base script.
 fn preload_script(inject: Option<(&str, &Value)>) -> String {
     let base = include_str!("../preloads/relay-bridge.js");
+    let registry = crate::selectors::load_registry();
+    let registry_json = serde_json::to_string(&registry).unwrap_or_default();
+    let head = format!("window.__RELAY_SELECTORS__ = {registry_json};\n");
     match inject {
         Some((provider, packet)) => {
             let prompt = serde_json::to_string(&injection_prompt(packet)).unwrap_or_default();
             let provider_json = serde_json::to_string(provider).unwrap_or_default();
             format!(
-                "window.__RELAY_INJECT__ = {{\"provider\": {provider_json}, \"prompt\": {prompt}}};\n{base}"
+                "{head}window.__RELAY_INJECT__ = {{\"provider\": {provider_json}, \"prompt\": {prompt}}};\n{base}"
             )
         }
-        None => base.to_string(),
+        None => format!("{head}{base}"),
     }
 }
 
@@ -271,6 +276,7 @@ pub async fn dock_set_bounds(
 #[tauri::command]
 pub async fn dock_scan(
     dock: State<'_, DockManager>,
+    engine: State<'_, RelayEngine>,
     provider: String,
 ) -> Result<Value, String> {
     let Some(webview) = dock.webviews.lock().unwrap().get(&provider).cloned() else {
@@ -303,6 +309,9 @@ pub async fn dock_scan(
     // keeps polling instead of surfacing an error the user can't act on.
     match serde_json::from_str::<Value>(&res) {
         Ok(value) => {
+            // Feed the captured conversation into the engine so the next
+            // handoff packet carries the source model's actual output.
+            engine.record_output(&provider, &value);
             let msgs = value
                 .get("messages_seen")
                 .and_then(|v| v.as_u64())

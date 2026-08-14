@@ -14,13 +14,23 @@ use tauri::{AppHandle, Emitter, State};
 use crate::fs;
 use crate::terminal::TerminalManager;
 use crate::types::{
-    ConversationSummary, HandoffEvent, ProjectContext, ProviderId, ProviderState, ProviderStatus,
-    RelayPacket, SessionState, TerminalState,
+    CodeChange, ConversationSummary, HandoffEvent, ProjectContext, ProviderId, ProviderState,
+    ProviderStatus, RelayPacket, SessionState, TerminalState,
 };
+
+/// What the dock scan captured from a provider page (rolling buffer of recent
+/// assistant messages + code blocks the model produced). Fed into the next
+/// handoff packet so the target model gets the source conversation.
+#[derive(Clone, Default)]
+pub struct CapturedOutput {
+    pub history: Vec<String>,
+    pub code_changes: Vec<CodeChange>,
+}
 
 pub struct RelayEngine {
     session: Mutex<SessionState>,
     packet_dir: PathBuf,
+    captured: Mutex<std::collections::HashMap<String, CapturedOutput>>,
 }
 
 impl Default for RelayEngine {
@@ -70,6 +80,7 @@ impl Default for RelayEngine {
                 handoffs: vec![],
             }),
             packet_dir,
+            captured: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -122,6 +133,47 @@ impl RelayEngine {
         }
         session.active_provider = Some(id);
     }
+
+    /// Store what the dock scan captured for a provider: the rolling buffer
+    /// of recent assistant messages and the code blocks the model produced.
+    /// The next handoff from this provider folds this into the packet.
+    pub fn record_output(&self, provider: &str, scan: &serde_json::Value) {
+        let mut captured = self.captured.lock().unwrap();
+        let entry = captured.entry(provider.to_string()).or_insert_with(|| CapturedOutput {
+            history: vec![],
+            code_changes: vec![],
+        });
+        if let Some(recent) = scan.get("recent").and_then(|v| v.as_array()) {
+            entry.history = recent
+                .iter()
+                .filter_map(|m| m.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                .collect();
+        }
+        if let Some(ops) = scan.get("file_ops").and_then(|v| v.as_array()) {
+            entry.code_changes = ops
+                .iter()
+                .filter_map(|op| {
+                    let file = op.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let code = op.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if code.is_empty() {
+                        return None;
+                    }
+                    let summary = code.lines().next().unwrap_or("").trim().to_string();
+                    let diff = if code.len() > 2000 {
+                        Some(code.chars().take(2000).collect())
+                    } else {
+                        Some(code)
+                    };
+                    Some(CodeChange {
+                        file,
+                        operation: "modified".into(),
+                        summary,
+                        diff,
+                    })
+                })
+                .collect();
+        }
+    }
 }
 
 #[tauri::command]
@@ -169,6 +221,27 @@ pub fn handoff(
     let (active_files, summaries, dependencies) = fs::project_context(&project);
     let terminal_state: TerminalState = terminals.snapshot();
 
+    // Fold in whatever the dock scan captured from the source provider
+    // (recent assistant messages + code blocks) so the packet carries the
+    // actual conversation, not just project + terminal state.
+    let captured = engine
+        .captured
+        .lock()
+        .unwrap()
+        .get(source.label())
+        .cloned();
+    let (total_exchanges, raw_log, code_changes) = match captured {
+        Some(c) => {
+            let log = if c.history.is_empty() {
+                None
+            } else {
+                Some(c.history.join("\n\n---\n\n"))
+            };
+            (c.history.len(), log, c.code_changes)
+        }
+        None => (0, None, vec![]),
+    };
+
     let packet = RelayPacket {
         relay_version: "1.0".into(),
         session_id: session.id.clone(),
@@ -184,16 +257,16 @@ pub fn handoff(
             dependencies,
         },
         conversation_summary: ConversationSummary {
-            total_exchanges: 0, // populated from preload transcript events (Phase 1)
+            total_exchanges,
             user_goals: vec![],
             key_decisions: vec![],
             current_task: "Continue the session from the previous model".into(),
             blockers: vec![],
-            code_changes: vec![],
+            code_changes,
         },
         terminal_state,
         pending_operations: vec![],
-        raw_conversation_log: None,
+        raw_conversation_log: raw_log,
     };
 
     let path = engine.packet_dir.join(format!("{}.json", packet.session_id));
