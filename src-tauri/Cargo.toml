@@ -1,0 +1,32 @@
+[package]
+name = "relay"
+version = "0.1.0"
+description = "Relay — multi-model vibe coding with the Relay Handoff Protocol"
+authors = ["Relay Team"]
+edition = "2021"
+
+[lib]
+name = "relay_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# v0.1 implementation note: the docs' tech stack listed node-pty; in Tauri the
+# idiomatic choice is a native Rust PTY (portable-pty) — no Node sidecar needed.
+# xterm.js on the frontend stays the same either way. (Docs changelog updated.)
+portable-pty = "0.9"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+rfd = "0.15"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

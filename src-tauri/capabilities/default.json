@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for the main Relay window: core events/window/ipc only. Provider webviews are remote pages and intentionally get NO capability — see Complete Docs §8.1 (Prompt Injection → IPC threat).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
